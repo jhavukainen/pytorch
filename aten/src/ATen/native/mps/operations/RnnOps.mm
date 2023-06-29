@@ -81,6 +81,38 @@ getMPSTensorsFromPytorchTensors(MPSGraph* mpsGraph,
   return std::make_tuple(stateTensor_, cellStateTensor_, recurrentWeight_, inputWeight_, biasTensor_);
 }
 
+static std::tuple<MPSGraphTensor*, MPSGraphTensor*, MPSGraphTensor*, MPSGraphTensor*, MPSGraphTensor*>
+getMPSGRUTensorsFromPytorch(MPSGraph* mpsGraph,
+                            MPSGraphTensor* stateTensor,
+                            NSMutableArray<MPSGraphTensor*>* recurrentKernelWeightsList,
+                            NSMutableArray<MPSGraphTensor*>* kernelWeightsList,
+                            NSMutableArray<MPSGraphTensor*>* kernelBiasList,
+                            NSMutableArray<MPSGraphTensor*>* recurrentKernelBiasList,
+                            bool has_biases,
+                            bool bidirectional,
+                            size_t layer_no,
+                            size_t num_neurons) {
+  MPSGraphTensor* bias_ = nil;
+  MPSGraphTensor* recurrentBias_ = nil;
+  MPSGraphTensor* state_ = nil;
+  MPSGraphTensor* recurrentWeight_ = nil;
+  MPSGraphTensor* kernelWeight_ = nil;
+
+  if (bidirectional) {
+    //TODO
+  }else{
+    state_ = [mpsGraph sliceTensor:stateTensor dimension:0 start:layer_no length:1 name:nil];
+    recurrentWeight_ = recurrentKernelWeightsList[layer_no];
+    kernelWeight_ = kernelWeightsList[layer_no];
+    if (has_biases) {
+      bias_ = kernelBiasList[layer_no];
+//      recurrentBias_ = recurrentKernelBiasList[layer_no];
+      recurrentBias_ = [mpsGraph sliceTensor:recurrentKernelBiasList[layer_no] dimension:0 start:2*num_neurons length:num_neurons name:nil];
+    }
+  }
+  return std::make_tuple(state_, recurrentWeight_, kernelWeight_, bias_, recurrentBias_);
+}
+
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> _lstm_mps(const Tensor& input,
                                                                      TensorList hx,
                                                                      TensorList params,
@@ -768,5 +800,208 @@ std::tuple<Tensor, std::vector<Tensor>, std::vector<Tensor>> lstm_mps_backward(c
     return std::tuple<Tensor, std::vector<Tensor>, std::vector<Tensor>>(output_out, grad_hx, weights);
   }
 }
+
+std::tuple<Tensor, Tensor, Tensor, Tensor> _gru_mps(const Tensor& input,
+                                                             const Tensor& hx,
+                                                             TensorList params,
+                                                             bool has_biases,
+                                                             int64_t num_layers,
+                                                             double dropout_p,
+                                                             bool train,
+                                                             bool bidirectional,
+                                                             bool batch_first) {
+  std::cout<<"RUNNING ON MPS DEVICE"<<std::endl;
+  using namespace mps; 
+  
+  std::vector<Tensor> kernel_weights;
+  std::vector<Tensor> recurrent_kernel_weights;
+  std::vector<Tensor> biases;
+  std::vector<Tensor> recurrent_biases;
+
+  const int64_t total_layers = num_layers * (bidirectional ? 2 : 1);
+  const int64_t num_neurons = hx.size(2);
+  
+  for (const auto i : c10::irange(total_layers)) {
+    const int stride = (has_biases ? 4 : 2);
+    kernel_weights.push_back(params[i * stride]);
+    recurrent_kernel_weights.push_back(params[i * stride + 1]);
+
+    if (has_biases) {
+      biases.push_back(params[i * stride + 2]);
+      recurrent_biases.push_back(params[i * stride + 3]);
+    }
+  }
+
+  struct CachedGraph : public MPSCachedGraph {
+    CachedGraph(MPSGraph* graph) : MPSCachedGraph(graph) {} 
+    std::vector<MPSGraphTensor*> inputTensors_;
+    std::vector<MPSGraphTensor*> outputTensors_;
+    NSMutableArray<MPSGraphTensor*>* kernelWeightsList_ = nil;
+    NSMutableArray<MPSGraphTensor*>* recurrentKernelWeightsList_ = nil;
+    NSMutableArray<MPSGraphTensor*>* biasList_ = nil;
+    NSMutableArray<MPSGraphTensor*>* recurrentBiasList_ = nil;
+  };
+
+  MPSStream* stream = getCurrentMPSStream();
+
+  @autoreleasepool {
+    string key = "gru_" + getTensorsStringKey({input, hx}) + getMPSTypeString(input) + "_num_layers_" +
+        std::to_string(num_layers) + "_bidirectional_" + std::to_string(bidirectional) + "_has_biases_" +
+        std::to_string(has_biases) + "_dropout_" + std::to_string(dropout_p) + "_batch_first_" +
+        std::to_string(batch_first);
+    auto cachedGraph = LookUpOrCreateCachedGraph<CachedGraph>(key, [&](auto mpsGraph, auto newCachedGraph) {
+      NSMutableArray<MPSGraphTensor*>* kernelWeightsList = [[NSMutableArray alloc] initWithCapacity:num_layers];
+      NSMutableArray<MPSGraphTensor*>* recurrentKernelWeightsList = [[NSMutableArray alloc] initWithCapacity:num_layers];
+      NSMutableArray<MPSGraphTensor*>* kernelBiasList = [[NSMutableArray alloc] initWithCapacity:num_layers];
+      NSMutableArray<MPSGraphTensor*>* recurrentKernelBiasList = [[NSMutableArray alloc] initWithCapacity:num_layers];
+      NSMutableArray<MPSGraphTensor*>* layersOutputsList = [[NSMutableArray alloc] initWithCapacity:num_layers];
+
+      for (const auto i : c10::irange(total_layers)) {
+        [kernelWeightsList addObject:mpsGraphRankedPlaceHolder(mpsGraph, getMPSDataType(input), getMPSShape(kernel_weights[i]))];
+        [recurrentKernelWeightsList addObject:mpsGraphRankedPlaceHolder(mpsGraph, getMPSDataType(input), getMPSShape(recurrent_kernel_weights[i]))];
+        if (has_biases) {
+          [kernelBiasList addObject:mpsGraphRankedPlaceHolder(mpsGraph, getMPSDataType(input), getMPSShape(biases[i]))];
+          [recurrentKernelBiasList addObject:mpsGraphRankedPlaceHolder(mpsGraph, getMPSDataType(input), getMPSShape(recurrent_biases[i]))];
+        }
+      }
+
+      MPSGraphGRUDescriptor* opDesc = [MPSGraphGRUDescriptor descriptor];
+//      opDesc.training = train;
+      opDesc.training = true;
+      opDesc.resetAfter = true;
+      opDesc.bidirectional = bidirectional;
+
+      MPSGraphTensor* inputTensor = mpsGraphRankedPlaceHolder(mpsGraph, getMPSDataType(input), getMPSShape(input));
+      MPSGraphTensor* stateTensor = mpsGraphRankedPlaceHolder(mpsGraph, getMPSDataType(input), getMPSShape(hx));
+      std::vector<MPSGraphTensor*> inputTensors = {inputTensor, stateTensor};
+
+      if (batch_first) {
+        inputTensor = [mpsGraph transposeTensor:inputTensor dimension:0 withDimension:1 name:nil];
+      }
+
+      MPSGraphTensor* inputTensor_ = inputTensor;
+      NSArray<MPSGraphTensor*>* outputs = nil;
+      NSMutableArray<MPSGraphTensor*>* outputStateArray = [[NSMutableArray alloc] initWithCapacity:num_layers];
+      NSMutableArray<MPSGraphTensor*>* outputZStateArray = [[NSMutableArray alloc] initWithCapacity:num_layers];
+      for (int i = 0; i < num_layers; i++) {
+        auto tensorData = getMPSGRUTensorsFromPytorch(mpsGraph,
+                                                      stateTensor,
+                                                      recurrentKernelWeightsList,
+                                                      kernelWeightsList,
+                                                      kernelBiasList,
+                                                      recurrentKernelBiasList,
+                                                      has_biases,
+                                                      bidirectional,
+                                                      i,
+                                                      num_neurons);
+        MPSGraphTensor *state_ = std::get<0>(tensorData);
+        MPSGraphTensor *recurrentWeight_ = std::get<1>(tensorData);
+        MPSGraphTensor *inputWeight_ = std::get<2>(tensorData);
+        MPSGraphTensor *bias_ = std::get<3>(tensorData);
+        //TODO slice the recurrent bias part
+        MPSGraphTensor *recurrentBias_ = std::get<4>(tensorData);
+        outputs = [mpsGraph GRUWithSourceTensor:inputTensor_
+                                recurrentWeight:recurrentWeight_
+                                    inputWeight:inputWeight_
+                                           bias:bias_
+                                      initState:state_
+                                           mask:nil
+                                  secondaryBias:recurrentBias_
+                                     descriptor:opDesc
+                                           name:nil];
+
+        inputTensor_ = [outputs objectAtIndex:0];
+        if (i != num_layers - 1) {
+          [layersOutputsList addObject:[mpsGraph expandDimsOfTensor:inputTensor_ axis:0 name:nil]];
+        }
+        if (dropout_p > 0.0 && train && (i != num_layers - 1)) {
+          inputTensor_ = [mpsGraph dropoutTensor:inputTensor_ rate:dropout_p name:nil];
+        }
+        if(bidirectional) {
+          //TODO: if bidirectional
+        }else{
+          [outputStateArray addObject:[mpsGraph sliceTensor:[outputs objectAtIndex:0]
+                                                  dimension:0
+                                                      start:-1
+                                                     length:1
+                                                       name:nil]];
+
+        }
+        //THIS FAILS
+        [outputZStateArray addObject:[mpsGraph expandDimsOfTensor:[outputs objectAtIndex:1] axis:0 name:nil]];
+      }
+
+      MPSGraphTensor *outputTensor = inputTensor_;
+      if (batch_first) {
+        outputTensor = [mpsGraph transposeTensor:outputTensor dimension:0 withDimension:1 name:nil];
+      }
+      MPSGraphTensor* outputStates = [mpsGraph concatTensors:outputStateArray dimension:0 name:nil];
+      MPSGraphTensor* outputZStates = [mpsGraph concatTensors:outputZStateArray dimension:0 name:nil];
+      MPSGraphTensor* layersOutputs = (num_layers > 1) ? [mpsGraph concatTensors:layersOutputsList dimension:0 name:nil] : nil;
+
+      std::vector<MPSGraphTensor*> outputTensors = {
+        outputTensor, outputStates, outputZStates, layersOutputs
+      };
+      
+      newCachedGraph->inputTensors_ = inputTensors;
+      newCachedGraph->outputTensors_ = outputTensors;
+      newCachedGraph->kernelWeightsList_ = kernelWeightsList;
+      newCachedGraph->recurrentKernelWeightsList_ = recurrentKernelWeightsList;
+      newCachedGraph->biasList_ = kernelBiasList;
+      newCachedGraph->recurrentBiasList_ = recurrentKernelBiasList;
+    });
+
+    NSMutableArray<MPSGraphTensor*>* kernelWeightsList = cachedGraph->kernelWeightsList_;
+    NSMutableArray<MPSGraphTensor*>* recurrentKernelWeightsList = cachedGraph->recurrentKernelWeightsList_;
+    NSMutableArray<MPSGraphTensor*>* biasList = cachedGraph->biasList_;
+    NSMutableArray<MPSGraphTensor*>* recurrentBiasList = cachedGraph->recurrentBiasList_;
+
+    NSMutableDictionary<MPSGraphTensor*, MPSGraphTensorData*>* feeds = [[[NSMutableDictionary alloc] init] autorelease];
+    for (const auto i : c10::irange(total_layers)) {
+      Placeholder kernelWeight = Placeholder([kernelWeightsList objectAtIndex:i], kernel_weights[i]);
+      Placeholder recurrentKernelWeight = Placeholder([recurrentKernelWeightsList objectAtIndex:i], recurrent_kernel_weights[i]);
+      [feeds setObject:kernelWeight.getMPSGraphTensorData() forKey:kernelWeight.getMPSGraphTensor()];
+      [feeds setObject:recurrentKernelWeight.getMPSGraphTensorData() forKey:recurrentKernelWeight.getMPSGraphTensor()];
+      if (has_biases) {
+        Placeholder bias = Placeholder([biasList objectAtIndex:i], biases[i]); 
+        Placeholder recurrentBias = Placeholder([recurrentBiasList objectAtIndex:i], recurrent_biases[i]); 
+        [feeds setObject:bias.getMPSGraphTensorData() forKey:bias.getMPSGraphTensor()];
+        [feeds setObject:recurrentBias.getMPSGraphTensorData() forKey:recurrentBias.getMPSGraphTensor()];
+      }
+    }
+    Placeholder selfPlaceholder = Placeholder(cachedGraph->inputTensors_[0], input);
+    Placeholder selfState = Placeholder(cachedGraph->inputTensors_[1], hx);
+    [feeds setObject:selfPlaceholder.getMPSGraphTensorData() forKey:selfPlaceholder.getMPSGraphTensor()];
+    [feeds setObject:selfState.getMPSGraphTensorData() forKey:selfState.getMPSGraphTensor()];
+
+    auto dims = getTensorShape(cachedGraph->outputTensors_[0]);
+    Tensor output = at::empty(IntArrayRef(dims), input.options());
+    Tensor hy = at::empty_like(hx, input.options());
+    Tensor zState = at::empty(IntArrayRef(getTensorShape(cachedGraph->outputTensors_[2])), input.options());
+    Tensor layerOutputs = (num_layers > 1) 
+        ? at::empty(IntArrayRef(getTensorShape(cachedGraph->outputTensors_[3])), input.options())
+        : at::empty({1}, input.options());
+
+    Placeholder outputPlaceholder0 = Placeholder(cachedGraph->outputTensors_[0], output);
+    Placeholder outputPlaceholder1 = Placeholder(cachedGraph->outputTensors_[1], hy);
+    Placeholder outputPlaceholder2 = Placeholder(cachedGraph->outputTensors_[2], zState);
+
+    NSMutableDictionary<MPSGraphTensor*, MPSGraphTensorData*>* results = [@{
+      outputPlaceholder0.getMPSGraphTensor() : outputPlaceholder0.getMPSGraphTensorData(),
+      outputPlaceholder1.getMPSGraphTensor() : outputPlaceholder1.getMPSGraphTensorData(),
+      outputPlaceholder2.getMPSGraphTensor() : outputPlaceholder2.getMPSGraphTensorData(),
+    } mutableCopy];
+
+    if (num_layers > 1) {
+      Placeholder outputPlaceholder4 = Placeholder(cachedGraph->outputTensors_[3], layerOutputs);
+      [results setObject:outputPlaceholder4.getMPSGraphTensorData() forKey:outputPlaceholder4.getMPSGraphTensor()];
+    }
+
+    runMPSGraph(stream, cachedGraph->graph(), feeds, results);
+    return std::make_tuple(output, hy, zState, layerOutputs);
+  }
+}
+
+
 
 } // namespace at::native

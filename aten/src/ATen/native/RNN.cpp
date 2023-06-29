@@ -21,6 +21,7 @@
 #include <ATen/NativeFunctions.h>
 #else
 #include <ATen/ops/_lstm_mps.h>
+#include <ATen/ops/_gru_mps.h>
 #include <ATen/ops/_thnn_differentiable_gru_cell_backward_native.h>
 #include <ATen/ops/_thnn_differentiable_lstm_cell_backward_native.h>
 #include <ATen/ops/_thnn_fused_gru_cell.h>
@@ -1219,6 +1220,19 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> _thnn_fused_lstm_cell_backwar
           bidirectional,                                                    \
           batch_first);                                                     \
       return std::make_tuple(std::move(output), std::move(hy));             \
+    }                                                                       \
+    if (_input.is_mps() && (mps::is_macos_13_or_newer())) {                      \
+      std::tuple<Tensor, Tensor, Tensor, Tensor> output = at::_gru_mps(     \
+          _input,                                                             \
+          hx,                                                               \
+          _params,                                                          \
+          has_biases,                                                       \
+          num_layers,                                                       \
+          dropout_p,                                                        \
+          train,                                                            \
+          bidirectional,                                                    \
+          batch_first);                                                     \
+      return std::make_tuple(std::get<0>(output), std::get<1>(output));     \
     }                                                                       \
     if (use_miopen(_input, dropout_p)) {                                    \
       Tensor output, hy;                                                    \
